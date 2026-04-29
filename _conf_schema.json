@@ -1,0 +1,38 @@
+{
+  "enabled": {
+    "description": "启用智能消息防抖动",
+    "type": "bool",
+    "hint": "关闭后插件不进行任何拦截处理",
+    "default": true
+  },
+  "api_base": {
+    "description": "LLM API 地址",
+    "type": "string",
+    "hint": "用于判断消息完整性的 API 地址，兼容 OpenAI 接口格式（如 https://api.openai.com）",
+    "default": ""
+  },
+  "api_key": {
+    "description": "API 密钥",
+    "type": "string",
+    "hint": "API 访问密钥",
+    "default": ""
+  },
+  "model": {
+    "description": "模型名称",
+    "type": "string",
+    "hint": "用于判断消息完整性的模型，建议使用轻量模型（如 gpt-3.5-turbo）以降低延迟",
+    "default": ""
+  },
+  "timeout_seconds": {
+    "description": "超时时间（秒）",
+    "type": "int",
+    "hint": "用户停止发送消息后，等待该时间后自动将缓冲的消息合并发送",
+    "default": 20
+  },
+  "prompt_template": {
+    "description": "判断消息完整性的提示词模板",
+    "type": "text",
+    "hint": "使用 {messages} 作为消息片段的占位符。模型需返回 JSON：{\"is_complete\": true} 或 {\"is_complete\": false}",
+    "default": "你是一个判断用户是否把话说完的助手。\n以下是用户连续发送的消息片段，请判断用户是否已经完整表达了他的意思。\n考虑以下情况：\n- 结尾有句号、问号、感叹号等结束标点 -> 可能说完了\n- 以「然后」「但是」「不过」「还有」等词结尾 -> 可能没说完\n- 只说了一个词或短语 -> 可能没说完\n- 明显是一句话的中间部分 -> 没说完\n- 一句话结构完整、意思清晰 -> 说完了\n\n仅返回JSON格式，不要包含其他内容：\n{\"is_complete\": true} 或 {\"is_complete\": false}\n\n用户消息片段：\n{messages}"
+  }
+}
