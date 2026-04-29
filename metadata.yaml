@@ -1,7 +1,7 @@
 name: astrbot_plugin_smart_debounce
 display_name: 智能消息防抖动
 desc: 在用户连续发送多条消息片段时，通过 LLM 智能判断消息是否完整表达，自动合并碎片化消息为一个完整请求，减少重复 LLM 调用。
-author: plugin_author
+author: hwesuer 白明
 version: 1.0.0
-repo: https://github.com/username/astrbot_plugin_smart_debounce
+repo: https://github.com/hwesuer/astrbot_plugin_smart_debounce
 astrbot_version: ">=4.23.6"
