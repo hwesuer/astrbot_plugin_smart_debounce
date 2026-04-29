@@ -43,8 +43,11 @@ class SmartDebounce(Star):
         # buffer: 按 session_id（每个用户/群聊一个 ID）暂存未说完的消息
         self.buffer: Dict[str, list] = {}
 
-        # timeout_tasks: 每个会话的超时后台任务
+        # timeout_tasks: 每个会话的超时后台任务（超过 timeout 后强制发送）
         self.timeout_tasks: Dict[str, asyncio.Task] = {}
+
+        # judge_tasks: 每个会话的判断延迟任务（等 judge_delay 秒后再调 API 判断）
+        self.judge_tasks: Dict[str, asyncio.Task] = {}
 
         # saved_events: 保存每个会话的原始事件对象，超时后伪造事件要用
         self.saved_events: Dict[str, AstrMessageEvent] = {}
@@ -63,11 +66,9 @@ class SmartDebounce(Star):
         所以 blockwords 会先拦截屏蔽词，然后才到我们这里。
 
         流程：
-        1. 把消息加入 buffer
-        2. 取消旧的超时任务（用户又打了新字）
-        3. 调 LLM API 判断当前累积的消息是否完整
-        4. 完整 → 合并消息，修改 req.prompt，放行
-        5. 不完整 → stop_event() 阻止消息，启动超时任务
+        1. 立即停止事件，把消息加入 buffer
+        2. 取消旧的 judge_delay 任务和 timeout 任务
+        3. 启动新的 judge_delay 任务（等待 judge_delay 秒后再判断）
         """
         # 如果插件被禁用了，直接放行所有消息
         if not self.config.get("enabled", True):
@@ -82,42 +83,82 @@ class SmartDebounce(Star):
         if not message:
             return
 
-        # 如果是超时后伪造的消息（由 _timeout_handler 生成），跳过防抖
+        # 如果是超时后伪造的消息，跳过防抖
         if msg_id in self.skip_debounce_msg_ids:
             self.skip_debounce_msg_ids.remove(msg_id)
             return
 
-        # 加锁，把消息存入 buffer
+        # 加锁，把消息存入 buffer，替换保存的事件
         async with self._lock:
             if session_id not in self.buffer:
                 self.buffer[session_id] = []
             self.buffer[session_id].append(message)
             self.saved_events[session_id] = event
 
-        # 如果有旧的超时任务，取消它（新消息来了，重新计时）
-        existing_task = self.timeout_tasks.pop(session_id, None)
-        if existing_task:
-            existing_task.cancel()
+        # 立即阻止当前消息继续传递
+        event.stop_event()
 
-        # 调 LLM API 判断当前累积的消息是否完整
-        is_complete = await self._check_completeness(self.buffer[session_id])
+        # 取消旧的 judge_delay 任务和 timeout 任务（新消息来了，重新计时）
+        old_judge = self.judge_tasks.pop(session_id, None)
+        if old_judge:
+            old_judge.cancel()
+        old_timeout = self.timeout_tasks.pop(session_id, None)
+        if old_timeout:
+            old_timeout.cancel()
 
-        if is_complete:
-            # 完整 → 从 buffer 取出所有消息，合并成一个字符串
+        # 启动新的 judge_delay 任务
+        judge_delay = float(self.config.get("judge_delay", 1.5))
+        task = asyncio.create_task(self._judge_handler(session_id, judge_delay))
+        self.judge_tasks[session_id] = task
+        logger.debug(f"[SmartDebounce] 消息已缓存，等待 {judge_delay} 秒后判断: session={session_id}")
+
+    async def _judge_handler(self, session_id: str, delay: float):
+        """
+        判断延迟处理：等待 delay 秒后，调 LLM API 判断当前累积的消息是否说完。
+        如果说完，伪造事件发送；如果没说完，启动超时任务继续等待。
+        """
+        try:
+            await asyncio.sleep(delay)
+
+            # 加锁读取 buffer
             async with self._lock:
-                merged = " ".join(self.buffer.pop(session_id, []))
-                self.saved_events.pop(session_id, None)
-            # 修改 req.prompt，这样 LLM 收到的是合并后的完整消息
-            req.prompt = merged
-            logger.info(f"[SmartDebounce] 消息完整，合并发送: \"{merged[:50]}...\"")
-        else:
-            # 不完整 → 阻止这条消息发给 LLM，等待用户继续输入
-            event.stop_event()
-            timeout = int(self.config.get("timeout_seconds", 20))
-            # 启动后台超时任务
-            task = asyncio.create_task(self._timeout_handler(session_id))
-            self.timeout_tasks[session_id] = task
-            logger.debug(f"[SmartDebounce] 消息不完整，等待更多输入: session={session_id}")
+                messages = list(self.buffer.get(session_id, []))
+                event = self.saved_events.get(session_id)
+
+            if not messages or not event:
+                return
+
+            # 调 LLM API 判断当前累积的消息是否完整
+            is_complete = await self._check_completeness(messages)
+
+            if is_complete:
+                # 说完了一从 buffer 取出合并，伪造事件发送
+                async with self._lock:
+                    merged = " ".join(self.buffer.pop(session_id, []))
+                    self.saved_events.pop(session_id, None)
+                self.judge_tasks.pop(session_id, None)
+
+                logger.info(f'[SmartDebounce] 判断完成，合并发送: "{merged[:50]}..."')
+                await self._forge_and_send(event, merged)
+            else:
+                # 没说完，启动超时任务
+                logger.debug(f"[SmartDebounce] 判断为未说完，启动超时等待: session={session_id}")
+                self.judge_tasks.pop(session_id, None)
+                timeout = int(self.config.get("timeout_seconds", 20))
+                task = asyncio.create_task(self._timeout_handler(session_id))
+                self.timeout_tasks[session_id] = task
+
+        except asyncio.CancelledError:
+            logger.debug(f"[SmartDebounce] 判断任务被取消: session={session_id}")
+        except Exception as e:
+            logger.error(f"[SmartDebounce] 判断处理出错: {e}")
+            # 出错时保守处理，发出去
+            async with self._lock:
+                messages = self.buffer.pop(session_id, None)
+                event = self.saved_events.pop(session_id, None)
+            if messages and event:
+                merged = " ".join(messages)
+                await self._forge_and_send(event, merged)
 
     async def _check_completeness(self, messages: list) -> bool:
         """
@@ -137,10 +178,17 @@ class SmartDebounce(Star):
         model = str(self.config.get("model", "")).strip()
         prompt_template = str(self.config.get(
             "prompt_template",
-            "你是一个判断用户是否把话说完的助手。以下是用户连续发送的消息片段，请判断用户是否已经完整表达了他的意思。考虑以下情况：1.结尾有句号、问号、感叹号等结束标点 - 可能说完了2.以「然后」「但是」「不过」「还有」等词结尾 -可能没说完3.只说了一个词或短语  -可能没说完4.明显是一句话的中间部分 - 没说完5.一句话结构完整、意思清晰 - 说完了"
-            "仅返回JSON格式，不要包含其他内容："
-            "{\"is_complete\": true} 或 {\"is_complete\": false}"
-            "用户消息片段：{messages}"
+            "你是一个判断用户是否把话说完的助手。\n"
+            "以下是用户连续发送的消息片段，请判断用户是否已经完整表达了他的意思。\n"
+            "考虑以下情况：\n"
+            "- 结尾有句号、问号、感叹号等结束标点 -> 可能说完了\n"
+            "- 以「然后」「但是」「不过」「还有」等词结尾 -> 可能没说完\n"
+            "- 只说了一个词或短语 -> 可能没说完\n"
+            "- 明显是一句话的中间部分 -> 没说完\n"
+            "- 一句话结构完整、意思清晰 -> 说完了\n\n"
+            "仅返回JSON格式，不要包含其他内容：\n"
+            '{"is_complete": true} 或 {"is_complete": false}\n\n'
+            "用户消息片段：\n{messages}"
         ))
 
         # 没配 API 就当成完整，直接放行（降级为普通模式）
@@ -190,45 +238,24 @@ class SmartDebounce(Star):
             logger.error(f"[SmartDebounce] LLM API error: {e}")
             return True
 
-    async def _timeout_handler(self, session_id: str):
+    async def _forge_and_send(self, event: AstrMessageEvent, merged: str):
         """
-        超时处理：用户说话说到一半停了，超时后自动把累积的消息发出去。
-        做法不是直接调 LLM，而是伪造一条消息事件重新走一遍消息管道，
-        这样 blockwords 等其他插件也能正常处理这条消息。
+        伪造一条消息事件发送合并后的文本。
+        这样消息会重新走一遍消息管道，blockwords 等插件也能正常处理。
         """
-        timeout = int(self.config.get("timeout_seconds", 20))
-        # 等待超时时间
-        await asyncio.sleep(timeout)
-
-        # 加锁，取出 buffer 里的消息和保存的事件
-        async with self._lock:
-            messages = self.buffer.pop(session_id, None)
-            self.timeout_tasks.pop(session_id, None)
-            event = self.saved_events.pop(session_id, None)
-
-        # 如果没消息或没有保存的事件，就算了
-        if not messages or not event:
-            return
-
-        # 合并消息
-        merged = " ".join(messages)
-        logger.info(f"[SmartDebounce] 超时，伪造事件发送: \"{merged[:50]}...\"")
-
         try:
-            # 导入 AstrBot 内部工具
             from astrbot.core.message.components import Plain
             from astrbot.core.star.star_tools import StarTools
 
-            # 保留原始消息里的非文本组件（比如图片、表情等）
+            # 保留原始消息里的非文本组件（图片、表情等）
             original_message = event.message_obj.message
             new_components = []
             for component in original_message:
                 if not isinstance(component, Plain):
                     new_components.append(component)
-            # 在开头插入合并后的文本
             new_components.insert(0, Plain(merged))
 
-            # 用 StarTools 创建一条新的消息对象
+            # 创建新消息对象
             new_message = await StarTools.create_message(
                 type=str(event.message_obj.type.value),
                 self_id=event.get_self_id(),
@@ -239,26 +266,47 @@ class SmartDebounce(Star):
                 group_id=event.get_group_id() or ""
             )
 
-            # 标记这条消息，让 on_llm_request 跳过防抖判断
+            # 标记跳过防抖
             self.skip_debounce_msg_ids.add(new_message.message_id)
 
-            # 把伪造的消息事件提交到事件总线，让它走正常流程
+            # 提交到事件总线
             await StarTools.create_event(
                 abm=new_message,
                 platform=event.get_platform_name(),
                 is_wake=True
             )
-            logger.debug(f"[SmartDebounce] 已伪造事件发送超时合并消息")
-
+            logger.debug(f"[SmartDebounce] 已伪造事件发送: \"{merged[:50]}...\"")
         except Exception as e:
-            logger.error(f"[SmartDebounce] 超时伪造事件失败: {e}")
+            logger.error(f"[SmartDebounce] 伪造事件失败: {e}")
+
+    async def _timeout_handler(self, session_id: str):
+        """
+        超时处理：用户说话说到一半停了，超时后自动把累积的消息发出去。
+        """
+        timeout = int(self.config.get("timeout_seconds", 20))
+        await asyncio.sleep(timeout)
+
+        async with self._lock:
+            messages = self.buffer.pop(session_id, None)
+            self.timeout_tasks.pop(session_id, None)
+            event = self.saved_events.pop(session_id, None)
+
+        if not messages or not event:
+            return
+
+        merged = " ".join(messages)
+        logger.info(f'[SmartDebounce] 超时，发送合并消息: "{merged[:50]}..."')
+        await self._forge_and_send(event, merged)
 
     async def terminate(self):
         """
         插件卸载时自动调用，清理所有资源。
         卸载前先把缓冲区里积压的消息发出去，避免用户说的话丢失。
         """
-        # 取消所有超时任务
+        # 取消所有判断任务和超时任务
+        for task in self.judge_tasks.values():
+            task.cancel()
+        self.judge_tasks.clear()
         for task in self.timeout_tasks.values():
             task.cancel()
         self.timeout_tasks.clear()
@@ -271,37 +319,8 @@ class SmartDebounce(Star):
             if not event:
                 continue
             merged = " ".join(messages)
-            logger.info(f"[SmartDebounce] 插件卸载，清空缓冲区发送: \"{merged[:50]}...\"")
-            try:
-                from astrbot.core.message.components import Plain
-                from astrbot.core.star.star_tools import StarTools
-
-                original_message = event.message_obj.message
-                new_components = []
-                for component in original_message:
-                    if not isinstance(component, Plain):
-                        new_components.append(component)
-                new_components.insert(0, Plain(merged))
-
-                new_message = await StarTools.create_message(
-                    type=str(event.message_obj.type.value),
-                    self_id=event.get_self_id(),
-                    session_id=event.session_id,
-                    sender=event.message_obj.sender,
-                    message=new_components,
-                    message_str=merged,
-                    group_id=event.get_group_id() or ""
-                )
-
-                self.skip_debounce_msg_ids.add(new_message.message_id)
-
-                await StarTools.create_event(
-                    abm=new_message,
-                    platform=event.get_platform_name(),
-                    is_wake=True
-                )
-            except Exception as e:
-                logger.error(f"[SmartDebounce] 卸载时发送缓冲区消息失败: {e}")
+            logger.info(f'[SmartDebounce] 插件卸载，清空缓冲区发送: "{merged[:50]}..."')
+            await self._forge_and_send(event, merged)
 
         # 清空缓冲区
         self.buffer.clear()
